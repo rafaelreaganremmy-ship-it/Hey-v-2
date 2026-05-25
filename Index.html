@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#080808" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <title>Hey V — AI Voice Assistant</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800;900&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+    html, body { height:100%; background:#080808; overflow-x:hidden; }
+    #root { min-height:100vh; }
+    ::-webkit-scrollbar { width:3px; }
+    ::-webkit-scrollbar-track { background:#111; }
+    ::-webkit-scrollbar-thumb { background:#222; border-radius:2px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react,env">
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ── Backend URL — change this to your Vercel URL after deploying ──
+const API_URL = "https://your-app.vercel.app";  // e.g. https://heyv.vercel.app
+
+// ═══════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════
+const FLW_KEY_STORAGE  = "heyv_flw_key";
+const APP_STORAGE      = "heyv_app_v3";
+const AUTH_STORAGE     = "heyv_auth_v1";
+const USERS_STORAGE    = "heyv_users_v1";
+
+// ═══════════════════════════════════════════════════════════════
+// CRYPTO — password hashing using Web Crypto API
+// ═══════════════════════════════════════════════════════════════
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password + "heyv_salt_2025");
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2,"0")).join("");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUTH HELPERS
+// ═══════════════════════════════════════════════════════════════
+async function getUsers() {
+  const r = await storageGet(USERS_STORAGE);
+  return r || {};
+}
+async function saveUsers(users) {
+  await storageSet(USERS_STORAGE, users);
+}
+async function registerUser(email, password, name) {
+  try {
+    const res = await fetch(API_URL + "/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, name }),
+    });
+    const data = await res.json();
+    if (data.ok && data.token) {
+      await storageSet("heyv_token", data.token);
+    }
+    return data;
+  } catch {
+    // Fallback to local if backend unreachable
+    const users = await getUsers();
+    const key = email.toLowerCase().trim();
+    if (users[key]) return { ok:false, error:"Email already registered" };
+    const hashed = await hashPassword(password);
+    users[key] = { email:key, name, password:hashed, plan:"Free", createdAt: Date.now() };
+    await saveUsers(users);
+    return { ok:true, user:{ email:key, name, plan:"Free" } };
+  }
+}
+async function loginUser(email, password) {
+  try {
+    const res = await fetch(API_URL + "/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await res.json();
+    if (data.ok && data.token) {
+      await storageSet("heyv_token", data.token);
+    }
+    return data;
+  } catch {
+    // Fallback to local if backend unreachable
+    const users = await getUsers();
+    const key = email.toLowerCase().trim();
+    if (!users[key]) return { ok:false, error:"Email not found" };
+    const hashed = await hashPassword(password);
+    if (users[key].password !== hashed) return { ok:false, error:"Wrong password" };
+    const { password:_, ...safe } = users[key];
+    return { ok:true, user:safe };
+  }
+}
+async function saveSession(user) {
+  await storageSet(AUTH_STORAGE, { user, loggedIn:true, ts: Date.now() });
+}
+async function clearSession() {
+  await storageSet(AUTH_STORAGE, { loggedIn:false });
+}
+async function getSession() {
+  const r = await storageGet(AUTH_STORAGE);
+  if (!r || !r.loggedIn) return null;
+  // Session expires after 30 days
+  if (Date.now() - r.ts > 30 * 24 * 60 * 60 * 1000) { await clearSession(); return null; }
+  return r.user;
+}
+
+const SONGS = [
+  { id:1, title:"Chill Vibes",    artist:"Lo-Fi Lab",    freq:220 },
+  { id:2, title:"Focus Mode",     artist:"Study Beats",  freq:264 },
+  { id:3, title:"Night Drive",    artist:"Synthwave Co", freq:330 },
+  { id:4, title:"Morning Energy", artist:"Boost FM",     freq:396 },
+  { id:5, title:"Deep Work",      artist:"Flow State",   freq:174 },
+];
+
+const PLANS = [
+  { name:"Free",  price:0,  tag:"FREE",   color:"#555",    perks:["3 contacts","Basic commands","In-app messages"] },
+  { name:"Pro",   price:14, tag:"$14/mo", color:"#4fffb0", perks:["Unlimited contacts","WhatsApp voice","Music control","Custom wake word","AI commands","Voice feedback"] },
+  { name:"Elite", price:29, tag:"$29/mo", color:"#ffd166", perks:["Everything in Pro","Priority support","Early features","Multi-language"] },
+];
+
+const DEFAULT_CONTACTS = [
+  { id:1, name:"Mom",   phone:"1234567890", wa:true  },
+  { id:2, name:"Dad",   phone:"1234567891", wa:true  },
+  { id:3, name:"James", phone:"1234567892", wa:true  },
+  { id:4, name:"Sarah", phone:"1234567893", wa:false },
+];
+
+// ═══════════════════════════════════════════════════════════════
+// STORAGE HELPERS
+// ═══════════════════════════════════════════════════════════════
+async function storageGet(key) {
+  try { const r = await window.storage.get(key); return r ? JSON.parse(r.value) : null; }
+  catch { return null; }
+}
+async function storageSet(key, val) {
+  try { await window.storage.set(key, JSON.stringify(val)); } catch {}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUDIO ENGINE
+// ═══════════════════════════════════════════════════════════════
+class AudioEngine {
+  constructor() { this.ctx = null; this.oscNodes = []; }
+  _getCtx() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return this.ctx;
+  }
+  beep(freq = 440, dur = 0.15, vol = 0.3) {
+    try {
+      const ctx = this._getCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = freq; osc.type = "sine";
+      gain.gain.setValueAtTime(0, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + 0.01);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + dur);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime + dur);
+    } catch {}
+  }
+  playSong(freq) {
+    this.stopSong();
+    try {
+      const ctx = this._getCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const filter = ctx.createBiquadFilter();
+      osc.type = "triangle"; osc.frequency.value = freq;
+      filter.type = "lowpass"; filter.frequency.value = 900;
+      gain.gain.value = 0.1;
+      osc.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
+      osc.start();
+      this.oscNodes = [osc, gain, filter];
+    } catch {}
+  }
+  stopSong() {
+    this.oscNodes.forEach(n => { try { n.disconnect(); if (n.stop) n.stop(); } catch {} });
+    this.oscNodes = [];
+  }
+  wake()    { this.beep(660, 0.08); setTimeout(() => this.beep(880, 0.1), 110); }
+  confirm() { [440, 550, 660].forEach((f, i) => setTimeout(() => this.beep(f, 0.09), i * 90)); }
+  success() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => this.beep(f, 0.12), i * 100)); }
+  error()   { this.beep(200, 0.25, 0.25); }
+}
+const audio = new AudioEngine();
+
+// ═══════════════════════════════════════════════════════════════
+// SPEECH SYNTHESIS (with cleanup)
+// ═══════════════════════════════════════════════════════════════
+let synthActive = true;
+// ── MIC VOLUME ANALYSER ──────────────────────────────────────
+function startVolumeAnalyser(onVolume) {
+  try {
+    navigator.mediaDevices.getUserMedia({ audio:true }).then(stream => {
+      const ctx      = new (window.AudioContext || window.webkitAudioContext)();
+      const source   = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const tick = () => {
+        analyser.getByteFrequencyData(data);
+        const avg = data.reduce((a,b) => a+b, 0) / data.length;
+        onVolume(Math.min(100, avg * 2));
+        return requestAnimationFrame(tick);
+      };
+      const id = tick();
+      return () => { cancelAnimationFrame(id); stream.getTracks().forEach(t=>t.stop()); ctx.close(); };
+    });
+  } catch {}
+}
+
+function speak(text) {
+  if (!synthActive) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.05; u.pitch = 1.1; u.volume = 0.9;
+    window.speechSynthesis.speak(u);
+  } catch {}
+}
+function cleanupSpeech() { synthActive = false; try { window.speechSynthesis.cancel(); } catch {} }
+
+// ═══════════════════════════════════════════════════════════════
+// AI COMMAND PROCESSOR  — with full header set + JSON protection
+// ═══════════════════════════════════════════════════════════════
+async function callAI(transcript, contactNames, plan) {
+  try {
+    const token = await storageGet("heyv_token");
+    const res = await fetch(API_URL + "/api/ai", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + (token || ""),
+      },
+      body: JSON.stringify({ transcript, contacts: contactNames, plan }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.ok ? data.result : null;
+  } catch { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FLUTTERWAVE LOADER
+// ═══════════════════════════════════════════════════════════════
+function loadFLW() {
+  return new Promise(resolve => {
+    if (window.FlutterwaveCheckout) { resolve(true); return; }
+    const s = document.createElement("script");
+    s.src = "https://checkout.flutterwave.com/v3.js";
+    s.onload  = () => resolve(true);
+    s.onerror = () => resolve(false);
+    document.head.appendChild(s);
+  });
+}
+async function payWithFLW({ publicKey, plan, name, email, phone, onSuccess, onClose }) {
+  const loaded = await loadFLW();
+  if (!loaded || !window.FlutterwaveCheckout) { alert("Payment gateway failed to load. Check your internet."); return; }
+  window.FlutterwaveCheckout({
+    public_key: publicKey,
+    tx_ref: `heyv_${Date.now()}`,
+    amount: plan.price,
+    currency: "USD",
+    payment_options: "card,mobilemoney,ussd,banktransfer",
+    customer: { name, email, phone_number: phone },
+    customizations: { title: "Hey V", description: `${plan.name} — ${plan.tag}/month` },
+    callback: r => { if (r.status === "successful" || r.status === "completed") onSuccess(r); },
+    onclose: onClose,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REUSABLE COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+
+function Orb({ phase, wave }) {
+  const color = phase === "idle" ? "#252525" : phase === "awake" ? "#4fffb0" : "#ffd166";
+  const glow  = phase !== "idle" ? `0 0 48px ${color}55` : "none";
+  return (
+    <div style={{ display:"flex", justifyContent:"center", margin:"4px 0 18px" }}>
+      <div style={{ position:"relative", width:140, height:140, display:"flex", alignItems:"center", justifyContent:"center" }}>
+        {phase !== "idle" && [0, 0.7].map(delay => (
+          <div key={delay} style={{ position:"absolute", width:140, height:140, borderRadius:"50%", border:`1px solid ${color}`, animation:`orbring 2.2s ease-out ${delay}s infinite`, opacity:0.25, pointerEvents:"none" }} />
+        ))}
+        <div style={{ width:96, height:96, borderRadius:"50%", background:"#111", border:`2px solid ${color}`, boxShadow:glow, display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.4s", zIndex:2, position:"relative" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:2, height:34 }}>
+            {wave.map((h, i) => (
+              <div key={i} style={{ width:3, height: phase !== "idle" ? h * 3 : 4, background:color, borderRadius:2, transition:"height 0.13s ease", opacity: phase === "idle" ? 0.1 : 1 }} />
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CallCard({ name, timer, onEnd }) {
+  const fmt = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+  return (
+    <div style={S.callCard}>
+      <span style={{ fontSize:20 }}>📞</span>
+      <div style={{ flex:1 }}>
+        <div style={{ color:"#fff", fontWeight:800 }}>{name}</div>
+        <div style={{ color:"#4fffb0", fontFamily:"monospace", fontSize:13 }}>{fmt(timer)}</div>
+      </div>
+      <button style={S.endBtn} onClick={onEnd}>End</button>
+    </div>
+  );
+}
+
+function MusicBar({ song, playing, onPrev, onToggle, onNext }) {
+  return (
+    <div style={S.musicCard}>
+      <div style={{ fontSize:20, ...(playing ? { animation:"spin 3s linear infinite" } : {}) }}>🎵</div>
+      <div style={{ flex:1, minWidth:0 }}>
+        <div style={{ color:"#fff", fontWeight:700, fontSize:13, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{song.title}</div>
+        <div style={{ color:"#555", fontSize:11 }}>{song.artist}</div>
+      </div>
+      <div style={{ display:"flex", gap:5, flexShrink:0 }}>
+        <button style={S.iconBtn} onClick={onPrev}>⏮</button>
+        <button style={S.iconBtn} onClick={onToggle}>{playing ? "⏸" : "▶"}</button>
+        <button style={S.iconBtn} onClick={onNext}>⏭</button>
+      </div>
+    </div>
+  );
+}
+
+function ContactRow({ contact, onEdit, onDelete, onWA }) {
+  return (
+    <div style={S.contactRow}>
+      <div style={S.avatar}>{contact.name[0]}</div>
+      <div style={{ flex:1, minWidth:0 }}>
+        <div style={{ color:"#fff", fontWeight:700, fontSize:14 }}>{contact.name}</div>
+        <div style={{ color:"#333", fontSize:11, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{contact.phone}</div>
+      </div>
+      <div style={{ display:"flex", gap:5, alignItems:"center", flexShrink:0 }}>
+        {contact.wa && <span style={S.waBadge}>WA</span>}
+        <button style={S.iconBtn} onClick={onEdit}>✏️</button>
+        {contact.wa && <button style={S.iconBtn} onClick={onWA}>🟢</button>}
+        <button style={{ ...S.iconBtn, color:"#ff4444" }} onClick={onDelete}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+function MsgBubble({ msg, isWA }) {
+  return (
+    <div style={{ ...S.msgItem, ...(isWA ? { borderColor:"#1a3326" } : {}) }}>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+        <span style={{ color: isWA ? "#4fffb0" : "#888", fontWeight:700, fontSize:11 }}>{isWA ? "🟢" : "💬"} {msg.to}</span>
+        <span style={{ color:"#333", fontSize:10 }}>{msg.time}</span>
+      </div>
+      <div style={{ color:"#bbb", fontSize:13 }}>{msg.text}</div>
+    </div>
+  );
+}
+
+function Overlay({ children }) {
+  return (
+    <div style={S.overlay}>
+      <div style={S.modal}>{children}</div>
+    </div>
+  );
+}
+
+function ModalHeader({ title, onClose }) {
+  return (
+    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:18 }}>
+      <span style={{ color:"#fff", fontWeight:900, fontSize:16 }}>{title}</span>
+      <button style={{ ...S.iconBtn, fontSize:14, color:"#555" }} onClick={onClose}>✕</button>
+    </div>
+  );
+}
+
+function Toggle({ on, onChange }) {
+  return (
+    <div onClick={onChange} style={{ width:42, height:24, borderRadius:99, background: on ? "#0d2e1f" : "#1e1e1e", border:`1px solid ${on ? "#4fffb0" : "#2a2a2a"}`, position:"relative", cursor:"pointer", transition:"all 0.3s", flexShrink:0 }}>
+      <div style={{ width:18, height:18, borderRadius:"50%", background: on ? "#4fffb0" : "#3a3a3a", position:"absolute", top:2, left: on ? 21 : 2, transition:"left 0.3s" }} />
+    </div>
+  );
+}
+
+function Input({ value, onChange, placeholder, type="text" }) {
+  return (
+    <input
+      type={type}
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      style={S.input}
+    />
+  );
+}
+
+function GreenBtn({ onClick, children, disabled, style={} }) {
+  return (
+    <button onClick={onClick} disabled={disabled} style={{ ...S.greenBtn, ...style, opacity: disabled ? 0.5 : 1 }}>
+      {children}
+    </button>
+  );
+}
+
+function StatusPill({ phase, status, wakeWord }) {
+  const color = phase === "idle" ? "#333" : phase === "awake" ? "#4fffb0" : "#ffd166";
+  const text  = phase === "idle" ? `Say "${wakeWord.toUpperCase()}"` : status;
+  return (
+    <div style={{ textAlign:"center", minHeight:40, marginBottom:14 }}>
+      <div style={{ color, fontSize:13, fontWeight:700, transition:"color 0.3s" }}>{text}</div>
+    </div>
+  );
+}
+
+function AIIndicator({ active }) {
+  if (!active) return null;
+  return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginBottom:10 }}>
+      <div style={{ width:6, height:6, borderRadius:"50%", background:"#ffd166", animation:"pulse 0.8s ease-in-out infinite" }} />
+      <div style={{ width:6, height:6, borderRadius:"50%", background:"#ffd166", animation:"pulse 0.8s ease-in-out 0.2s infinite" }} />
+      <div style={{ width:6, height:6, borderRadius:"50%", background:"#ffd166", animation:"pulse 0.8s ease-in-out 0.4s infinite" }} />
+      <span style={{ color:"#ffd166", fontSize:11, letterSpacing:1 }}>AI thinking</span>
+    </div>
+  );
+}
+
+function PermissionBanner({ onRequest }) {
+  return (
+    <div style={{ background:"#1a0a00", border:"1px solid #ff6b2244", borderRadius:12, padding:14, marginBottom:12, textAlign:"center" }}>
+      <div style={{ fontSize:24, marginBottom:6 }}>🎤</div>
+      <div style={{ color:"#ff9966", fontSize:13, fontWeight:700, marginBottom:6 }}>Microphone access needed</div>
+      <div style={{ color:"#555", fontSize:12, marginBottom:12 }}>Hey V needs your mic to listen for voice commands</div>
+      <GreenBtn onClick={onRequest} style={{ width:"100%" }}>Allow Microphone</GreenBtn>
+    </div>
+  );
+}
+
+function OfflineBanner() {
+  return (
+    <div style={{ background:"#1a1000", border:"1px solid #ffd16644", borderRadius:10, padding:10, marginBottom:10, display:"flex", alignItems:"center", gap:8 }}>
+      <span>⚠️</span>
+      <span style={{ color:"#ffd166", fontSize:12 }}>You are offline — AI features paused</span>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ONBOARDING SCREEN
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// AUTH SCREEN
+// ═══════════════════════════════════════════════════════════════
+function AuthScreen({ onAuth }) {
+  const [mode,     setMode]     = useState("login");
+  const [name,     setName]     = useState("");
+  const [email,    setEmail]    = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm,  setConfirm]  = useState("");
+  const [showPw,   setShowPw]   = useState(false);
+  const [error,    setError]    = useState("");
+  const [success,  setSuccess]  = useState("");
+  const [loading,  setLoading]  = useState(false);
+
+  const strength = password.length >= 10 ? "strong" : password.length >= 7 ? "medium" : "weak";
+  const strengthColor
